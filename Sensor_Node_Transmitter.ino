@@ -1,116 +1,153 @@
 /*
- * DPV PROJECT: SENSOR NODE TRANSMITTER (VER 2.0)
- * --------------------------------------------
- * โค้ดสำหรับบอร์ดส่งสัญญาณที่เชื่อมต่อกับเซนเซอร์ (Slave Node)
- * ทำหน้าที่อ่านค่าจาก BNO055 และ BMP280 แล้วส่งข้อมูลผ่าน ESP-NOW
- */
+ * =================================================================================
+ * DPV PROJECT: SENSOR NODE TRANSMITTER (VER 2.1)
+ * =================================================================================
+ * 
+ * [คำอธิบายภาษาไทย]
+ * โค้ดนี้สำหรับบอร์ดส่งสัญญาณ (Slave Node) ทำหน้าที่:
+ * 1. อ่านข้อมูลเข็มทิศและทิศทางจาก BNO055
+ * 2. อ่านค่าความดันและอุณหภูมิจาก BMP280 เพื่อคำนวณความลึก
+ * 3. ส่งข้อมูลทั้งหมดไปยังบอร์ดหลัก (Main Board) ผ่านโปรโตคอล ESP-NOW
+ * 
+ * [Technical Design Note]
+ * - การสื่อสารใช้ ESP-NOW ซึ่งเร็วกว่า WiFi ปกติและประหยัดพลังงานกว่า
+ * - การส่งข้อมูลแบบ Unicast (เจาะจง MAC Address) จะมีความเสถียรสูงสุด
+ * - โครงสร้างข้อมูล (Struct) ต้องตรงกันทั้งฝั่งรับและส่ง เพื่อให้การแมป Byte ถูกต้อง
+*/
 
-#include <esp_now.h>       // ไลบรารีสำหรับการสื่อสารไร้สาย ESP-NOW
-#include <WiFi.h>          // ไลบรารีสำหรับควบคุม WiFi
-#include <Wire.h>          // ไลบรารีสำหรับการเชื่อมต่อ I2C
-#include <esp_wifi.h>      // ไลบรารีสำหรับตั้งค่า WiFi ขั้นสูง
+#include <esp_now.h>       // ESP-NOW Protocol: การสื่อสารไร้สายความเร็วสูงโดยไม่ต้องใช้ Router
+#include <WiFi.h>          // WiFi Driver: ต้องเปิดไว้เพื่อให้ ESP-NOW ทำงานได้
+#include <Wire.h>          // I2C Communication: สำหรับคุยกับเซนเซอร์ทางสาย SDA/SCL
+#include <esp_wifi.h>      // Low-level WiFi settings: ใช้สำหรับล็อค Channel
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BNO055.h> // ไลบรารีสำหรับเซนเซอร์ IMU BNO055 (เข็มทิศ/ความเอียง)
-#include <Adafruit_BMP280.h> // ไลบรารีสำหรับเซนเซอร์ BMP280 (อุณหภูมิ/ความดัน/ความลึก)
+#include <Adafruit_BNO055.h> // IMU Sensor: วัดแรงดึงดูดโลกและสนามแม่เหล็กเพื่อหาทิศทาง
+#include <Adafruit_BMP280.h> // Barometric Sensor: วัดความดันอากาศ/น้ำเพื่อหาความลึก
 
-// --- CONFIGURATION / การตั้งค่า ---
-// ใส่ MAC Address ของบอร์ดรับสัญญาณ (Main Board) ที่นี่
+// --- [MAC Address Configuration] ---
+/**
+ * broadcastAddress: เลขที่อยู่ประจำตัวบอร์ดรับสัญญาณ (Main Board)
+ * NOTE: หากผลิตจำนวนมาก (Mass Production) ค่านี้จะเป็นปัญหาเพราะบอร์ดแต่ละใบมี MAC ไม่ซ้ำกัน
+ * วิธีแก้ในอนาคต: ใช้ระบบ Broadcast เพื่อหาคู่ (Pairing) แล้วบันทึกค่าลง Preferences/EEPROM
+ */
 uint8_t broadcastAddress[] = {0xD8, 0x3B, 0xDA, 0x70, 0xA3, 0xA8};
 
-// โครงสร้างข้อมูลสำหรับส่งออก (ต้องตรงกับฝั่งรับทุกประการ!)
+// --- [Data Structure / โครงสร้างข้อมูล] ---
+/**
+ * SensorData: โครงสร้างข้อมูลขนาดคงที่ (Fixed-size memory block)
+ * สำคัญมาก: ลำดับและชนิดของตัวแปรต้องตรงกับ "บอร์ดรับ" ทุกประการ (Byte-by-Byte mapping)
+ */
 typedef struct {
-    float heading;      // ทิศทาง (0-360 องศา)
-    float pitch;        // ความชัน (ก้ม/เงย)
-    float roll;         // การเอียง (ซ้าย/ขวา)
-    float speed;        // ความเร็ว (ถ้ามี)
-    float depth;        // ความลึก (คำนวณจากความดัน)
-    float temperature;  // อุณหภูมิ
-    float pressure;     // ความดันบรรยากาศ/ใต้น้ำ
-    uint32_t packet_id; // ลำดับแพ็กเกจ (ใช้เช็คการสูญหายของข้อมูล)
-    bool bno_online;    // สถานะเซนเซอร์ BNO055
-    bool bmp_online;    // สถานะเซนเซอร์ BMP280
+    float heading;      // [ทิศทาง] 0.00 - 359.99 องศา (อ้างอิงทิศเหนือแม่เหล็ก)
+    float depth;        // [ความลึก] หน่วยเป็นเมตร (m) คำนวณจากความดัน
+    float temperature;  // [อุณหภูมิ] หน่วยเป็นองศาเซลเซียส (°C)
+    // ยังไม่ได้ใช้
+    float speed;        // [ความเร็ว] เผื่อไว้สำหรับการคำนวณในอนาคต
+    float pitch;        // [ความชัน] ก้ม/เงย (Note: ปัจจุบันยังไม่ได้นำไปใช้งานใน logic หลัก)
+    float roll;         // [การเอียง] ซ้าย/ขวา (Note: ปัจจุบันยังไม่ได้นำไปใช้งานใน logic หลัก)
+    float pressure;     // [ความดัน] หน่วยเป็น hPa
+    uint32_t packet_id; // [Sync ID] เลขรันลำดับเพื่อเช็คว่าข้อมูลที่รับมา "สดใหม่" หรือตกหล่นไหม
+    bool bno_online;    // [Status] เช็คว่าเซนเซอร์ BNO055 ยังเชื่อมต่ออยู่ไหม
+    bool bmp_online;    // [Status] เช็คว่าเซนเซอร์ BMP280 ยังเชื่อมต่ออยู่ไหม
 } SensorData;
 
-SensorData myData;           // ตัวแปรสำหรับเก็บข้อมูลที่จะส่ง
-esp_now_peer_info_t peerInfo; // ข้อมูลของอุปกรณ์ที่จะส่งไปหา
+SensorData myData;           // พื้นที่หน่วยความจำสำหรับเก็บข้อมูลชุดปัจจุบัน
+esp_now_peer_info_t peerInfo; // โครงสร้างข้อมูลสำหรับลงทะเบียนเครื่องรับ (Peer)
 
-// ประกาศใช้งานเซนเซอร์
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
+// --- [Sensor Instances] ---
+// BNO055: 0x28 คือ address มาตรฐาน, Wire คือใช้ I2C หลัก
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire); 
+// BMP280: จะกำหนด address 0x76 ในตอน bno.begin()
 Adafruit_BMP280 bmp; 
 
-// ฟังก์ชัน Callback เมื่อส่งข้อมูลสำเร็จหรือไม่สำเร็จ (Optional)
+// --- [Callback functions] ---
+// ฟังก์ชันนี้จะถูกเรียกอัตโนมัติเมื่อ ESP-NOW ส่งข้อมูลเสร็จ (ไม่ว่าจะสำเร็จหรือล้มเหลว)
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    // สามารถเพิ่มโค้ดตรวจสอบสถานะการส่งตรงนี้ได้
+    // status == ESP_NOW_SEND_SUCCESS หมายถึงเครื่องรับได้รับข้อมูลและตอบกลับ ACK มาแล้ว
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+  Serial.begin(115200);   // ตั้งค่าความเร็วสื่อสารกับคอมพิวเตอร์
+  delay(1000);            // รอให้ Serial พร้อมทำงาน
   
-  Serial.println("--- [DPV] DUAL-BOARD MODE: SENSOR SLAVE (VER 2.0) ---");
+  Serial.println("--- [DPV] SENSOR SLAVE NODES (VER 2.1) ---");
 
-  // 1. เริ่มต้นการทำงานของเซนเซอร์ (Initialize Sensors)
-  Wire.begin(); 
-  myData.bno_online = bno.begin();      // ลองเชื่อมต่อ BNO055
-  myData.bmp_online = bmp.begin(0x76);  // ลองเชื่อมต่อ BMP280 (ที่อยู่ I2C มักเป็น 0x76)
+  // --- 1. SENSOR INITIALIZATION ---
+  Wire.begin(); // เริ่มต้นบัส I2C
+  
+  // ตรวจสอบการเชื่อมต่อเซนเซอร์
+  myData.bno_online = bno.begin();      
+  myData.bmp_online = bmp.begin(0x76);  // เซนเซอร์ส่วนใหญ่ในโมดูลสำเร็จรูปใช้ 0x76
 
-  // แสดงสถานะการเชื่อมต่อเซนเซอร์ทาง Serial Monitor
   Serial.printf("BNO: %s, BMP: %s\n", myData.bno_online ? "OK" : "ERR", myData.bmp_online ? "OK" : "ERR");
 
-  // 2. เริ่มต้น ESP-NOW บนช่องสัญญาณที่ 1 (Channel 1)
-  WiFi.mode(WIFI_STA); 
+  // --- 2. ESP-NOW SETUP ---
+  WiFi.mode(WIFI_STA); // ต้องอยู่ในโหมด Station เพื่อให้ Driver ของ WiFi ทำงาน
+  
+  /**
+   * [Channel Locking Mechanism]
+   * ESP-NOW จะเสถียรที่สุดถ้าส่งและรับอยู่ในช่องสัญญาณ (Channel) เดียวกัน
+   * ขั้นตอน: เปิดโหมด Promiscuous -> ตั้งค่า Channel -> ปิดโหมด
+   */
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // ล็อคช่องสัญญาณให้ตรงกับบอร์ดรับ
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // ล็อคที่ Channel 1
   esp_wifi_set_promiscuous(false);
 
-  // ตรวจสอบความผิดพลาดในการเริ่ม ESP-NOW
+  // เริ่มต้น ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    Serial.println("Error: ESP-NOW initialization failed!");
     return;
   }
 
-  // ลงทะเบียนฟังก์ชันส่งข้อมูล
+  // ลงทะเบียนฟังก์ชันติดตามผลการส่ง
   esp_now_register_send_cb((esp_now_send_cb_t)OnDataSent);
   
-  // ตั้งค่าข้อมูล Peer (อุปกรณ์ฝั่งรับ)
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 1;      // ช่องสัญญาณ 1
-  peerInfo.encrypt = false;  // ไม่ใช้การเข้ารหัส
+  // ตั้งค่าข้อมูลของเครื่องรับ (Peer Information)
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6); // คัดลอก MAC Address
+  peerInfo.channel = 1;      // กำหนดช่องสัญญาณให้ตรงกัน
+  peerInfo.encrypt = false;  // ปิดการเข้ารหัสเพื่อความเร็วและความง่ายในการทดสอบ
   
-  // เพิ่ม Peer เข้าไปในระบบ
+  // เพิ่มบอร์ดรับเข้าไปในรายการที่บอร์ดนี้จะคุยด้วย
   if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Failed to add peer");
+    Serial.println("Error: Failed to add Peer");
     return;
   }
 }
 
 void loop() {
-  // 1. อ่านค่าจากเซนเซอร์ BNO055 (เข็มทิศและการเอียง)
+  // --- 1. DATA ACQUISITION (BNO055) ---
   if (myData.bno_online) {
     sensors_event_t event;
     bno.getEvent(&event);
-    myData.heading = event.orientation.x; // ทิศ (Yaw)
-    myData.roll    = event.orientation.z; // เอียงซ้ายขวา (Roll)
-    myData.pitch   = event.orientation.y; // ก้มเงย (Pitch)
+    // อ่านค่าองศา (Euler Angles)
+    myData.heading = event.orientation.x; // ทิศเหนือแม่เหล็ก (0-360°)
+    myData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
+    myData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
   }
 
-  // 2. อ่านค่าจากเซนเซอร์ BMP280 (ความดัน อุณหภูมิ และความลึก)
+  // --- 2. DATA ACQUISITION (BMP280) ---
   if (myData.bmp_online) {
-    myData.temperature = bmp.readTemperature();          // อุณหภูมิเซลเซียส
-    myData.pressure    = bmp.readPressure() / 100.0F;    // ความดัน hPa
-    // สูตรคำนวณความลึกเบื้องต้น (ความดันเปลี่ยนแปลงตามความลึก)
-    myData.depth       = (myData.pressure - 1013.25) * 0.01; 
+    myData.temperature = bmp.readTemperature();       // อุณหภูมิ
+    myData.pressure    = bmp.readPressure() / 100.0F; // แปลงหน่วย Pascal เป็น hPa (hectopascal)
+    
+    /**
+     * [Depth Calculation Logic]
+     * สูตรพื้นฐาน: ทุกๆ 1 hPa ที่เพิ่มขึ้นเหนือบิเวณผิวน้ำ (Standard 1013.25)
+     * จะประมาณค่าความลึกได้ (ในการใช้งานจริงต้องปรับจูนสูตรตามความเค็มหรือแรงดันผิวน้ำขณะนั้น)
+     */
+    myData.depth = (myData.pressure - 1013.25) * 0.01; 
   }
 
-  // 3. เพิ่มเลขลำดับ Packet (Sync ID)
+  // --- 3. SYNCHRONIZATION ---
   static uint32_t p_id = 0;
-  myData.packet_id = p_id++;
+  myData.packet_id = p_id++; // เพิ่มเลข ID ไปเรื่อยๆ เพื่อให้ฝั่งรับรู้ว่าข้อมูลมีการเคลื่อนไหว
 
-  // 4. ส่งข้อมูลไปยังบอร์ดรับผ่าน ESP-NOW
+  // --- 4. WIRELESS TRANSMISSION ---
+  // ส่งข้อมูลดิบทั้งก้อน (struct) ผ่าน ESP-NOW
   esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
   
-  // --- แสดงข้อมูลออกทาง Serial Monitor (เพื่อตรวจสอบ) ---
-  Serial.println("\n========== SENSOR DATA ==========");
+  // --- 5. DIAGNOSTIC PRINT (FOR DEBUGGING) ---
+  // ส่วนนี้ใช้สำหรับดูผ่านหน้าจอคอมพิวเตอร์เท่านั้น ไม่เกี่ยวข้องกับการส่งข้อมูล
+  Serial.printf("\n[PACKET #%u]\n", myData.packet_id);
   
   // ข้อมูล BNO055
   Serial.println("--- BNO055 (IMU) ---");
@@ -131,7 +168,7 @@ void loop() {
   } else {
     Serial.println("❌ BMP280 OFFLINE");
   }
-  
+
   // สถานะการทำงาน
   Serial.println("\n--- Status ---");
   Serial.printf("Packet ID:      %u\n", myData.packet_id);
@@ -140,4 +177,3 @@ void loop() {
 
   delay(200); // หน่วงเวลา 200ms (ส่งข้อมูล 5 ครั้งต่อวินาที)
 }
-
