@@ -125,7 +125,12 @@ void setup() {
    // -----------------------------------------------------------------------------------------------------------------------
 }
 
-void loop() {
+void loop() {  
+   // เช็ค BMP280 (0x76)
+  Wire.beginTransmission(0x76);
+  bool bmp_present = (Wire.endTransmission() == 0);
+
+  // --- 1. DATA (BNO055) ---
   // --- 1. DATA (BNO055) ---
   if (sent_sensorData.bno_online) {
     sensors_event_t event;
@@ -133,27 +138,38 @@ void loop() {
     sent_sensorData.direction = event.orientation.x; // ทิศเหนือแม่เหล็ก (0-360°)
     sent_sensorData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
-
-
-
-
     sent_sensorData.battery = 100;
     sent_sensorData.speed = 0;
   }
 
-  // --- 2. DATA (BMP280) ---
-  if (sent_sensorData.bmp_online) {
-    sent_sensorData.temperature = bmp.readTemperature();       // อุณหภูมิ
-    sent_sensorData.pressure    = bmp.readPressure() / 100.0F; // แปลงหน่วย Pascal เป็น hPa (hectopascal)
-    
-    /**
-     * [Depth Calculation Logic]
-     * สูตรพื้นฐาน: ทุกๆ 1 hPa ที่เพิ่มขึ้นเหนือบิเวณผิวน้ำ (Standard 1013.25)
-     * จะประมาณค่าความลึกได้ (ในการใช้งานจริงต้องปรับจูนสูตรตามความเค็มหรือแรงดันผิวน้ำขณะนั้น)
-     */
-    // sent_sensorData.depth = (sent_sensorData.pressure - 1013.25) * 0.01; 
-    sent_sensorData.depth = 40;
+ 
+    // --- 2. DATA (BMP280) ---
+  float t = bmp.readTemperature();
+  // ต้องเจอตัว (Ping สำเร็จ) และ ค่าไม่เป็น NaN และ อุณหภูมิไม่สูงผิดปกติ
+  if (bmp_present && !isnan(t) && t < 150.0f) {
+    sent_sensorData.bmp_online = true;
+    sent_sensorData.temperature = t;
+    sent_sensorData.pressure    = bmp.readPressure() / 100.0F;
+  } else {
+    sent_sensorData.bmp_online = false;
+    sent_sensorData.temperature = 0;
+    sent_sensorData.pressure    = 0;
+    if (bmp_present) bmp.begin(0x76); // ถ้าสายยังอยู่แต่เอ๋อ ให้ลองเริ่มใหม่
   }
+
+
+
+
+  // --- 3. OTHER DATA ---
+  sent_sensorData.battery = 100; // Simulated battery
+  sent_sensorData.speed   = 0;   // Simulated speed
+  sent_sensorData.depth   = 40.0; // Hardcoded depth as per requirement
+
+
+
+
+
+
 
   // --- 3. SYNCHRONIZATION ---
   static uint32_t p_id = 0;
@@ -213,3 +229,22 @@ void loop() {
 
   delay(200); // หน่วงเวลา 200ms (ส่งข้อมูล 5 ครั้งต่อวินาที)
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
