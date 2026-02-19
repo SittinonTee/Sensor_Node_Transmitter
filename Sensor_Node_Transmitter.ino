@@ -37,20 +37,26 @@ uint8_t broadcastAddress[] = {0xD8, 0x3B, 0xDA, 0x70, 0xA3, 0xA8};
  * สำคัญมาก: ลำดับและชนิดของตัวแปรต้องตรงกับ "บอร์ดรับ" ทุกประการ (Byte-by-Byte mapping)
  */
 typedef struct {
-    float heading;      // [ทิศทาง] 0.00 - 359.99 องศา (อ้างอิงทิศเหนือแม่เหล็ก)
-    float depth;        // [ความลึก] หน่วยเป็นเมตร (m) คำนวณจากความดัน
-    float temperature;  // [อุณหภูมิ] หน่วยเป็นองศาเซลเซียส (°C)
+    float direction;      // [ทิศทาง] 0.00 - 359.99 องศา (อ้างอิงทิศเหนือแม่เหล็ก)
+    float temperature;    // [อุณหภูมิ] หน่วยเป็นองศาเซลเซียส (°C)
+
     // ยังไม่ได้ใช้
-    float speed;        // [ความเร็ว] เผื่อไว้สำหรับการคำนวณในอนาคต
-    float pitch;        // [ความชัน] ก้ม/เงย (Note: ปัจจุบันยังไม่ได้นำไปใช้งานใน logic หลัก)
-    float roll;         // [การเอียง] ซ้าย/ขวา (Note: ปัจจุบันยังไม่ได้นำไปใช้งานใน logic หลัก)
+    int battery;        // [อุปกรณ์] ค่าแบตเตอรี่ (เปอร์เซ็นต์)
+    int speed;        // [ความเร็ว] เผื่อไว้สำหรับการคำนวณในอนาคต
     float pressure;     // [ความดัน] หน่วยเป็น hPa
+    float depth;          // [ความลึก] หน่วยเป็นเมตร (m) คำนวณจากความดัน
+
+    // สถานะpacket
     uint32_t packet_id; // [Sync ID] เลขรันลำดับเพื่อเช็คว่าข้อมูลที่รับมา "สดใหม่" หรือตกหล่นไหม
     bool bno_online;    // [Status] เช็คว่าเซนเซอร์ BNO055 ยังเชื่อมต่ออยู่ไหม
     bool bmp_online;    // [Status] เช็คว่าเซนเซอร์ BMP280 ยังเชื่อมต่ออยู่ไหม
-} SensorData;
 
-SensorData myData;           // พื้นที่หน่วยความจำสำหรับเก็บข้อมูลชุดปัจจุบัน
+    // ยังไม่ได้ใช้ทิ้งไว้สำหรับการคำนวณในอนาคต
+    float pitch;        // [ความชัน] ก้ม/เงย (Note: ปัจจุบันยังไม่ได้นำไปใช้งานใน logic หลัก)
+    float roll;         // [การเอียง] ซ้าย/ขวา (Note: ปัจจุบันยังไม่ได้นำไปใช้งานใน logic หลัก)
+} __attribute__((packed)) SensorData;
+
+SensorData sent_sensorData;           // พื้นที่หน่วยความจำสำหรับเก็บข้อมูลชุดปัจจุบัน
 esp_now_peer_info_t peerInfo; // โครงสร้างข้อมูลสำหรับลงทะเบียนเครื่องรับ (Peer)
 
 // --- [Sensor Instances] ---
@@ -75,10 +81,14 @@ void setup() {
   Wire.begin(); // เริ่มต้นบัส I2C
   
   // ตรวจสอบการเชื่อมต่อเซนเซอร์
-  myData.bno_online = bno.begin();      
-  myData.bmp_online = bmp.begin(0x76);  // เซนเซอร์ส่วนใหญ่ในโมดูลสำเร็จรูปใช้ 0x76
+  sent_sensorData.bno_online = bno.begin();      
+  sent_sensorData.bmp_online = bmp.begin(0x76);  // เซนเซอร์ส่วนใหญ่ในโมดูลสำเร็จรูปใช้ 0x76
 
-  Serial.printf("BNO: %s, BMP: %s\n", myData.bno_online ? "OK" : "ERR", myData.bmp_online ? "OK" : "ERR");
+  Serial.printf("BNO: %s, BMP: %s\n", sent_sensorData.bno_online ? "OK" : "ERR", sent_sensorData.bmp_online ? "OK" : "ERR");
+
+
+
+ // -----------------------------------------เปิดโหมด Promiscuous เพื่อให้ ESP-NOW ทำงาน อย่าไปยุ่งมันถ้าไม่จำเป็น--------------------------------------------------------------------------
 
   // --- 2. ESP-NOW SETUP ---
   WiFi.mode(WIFI_STA); // ต้องอยู่ในโหมด Station เพื่อให้ Driver ของ WiFi ทำงาน
@@ -102,6 +112,7 @@ void setup() {
   esp_now_register_send_cb((esp_now_send_cb_t)OnDataSent);
   
   // ตั้งค่าข้อมูลของเครื่องรับ (Peer Information)
+  memset(&peerInfo, 0, sizeof(peerInfo));          // ล้างข้อมูลเก่าเพื่อให้แน่ใจว่าไม่มีขยะในหน่วยความจำ
   memcpy(peerInfo.peer_addr, broadcastAddress, 6); // คัดลอก MAC Address
   peerInfo.channel = 1;      // กำหนดช่องสัญญาณให้ตรงกัน
   peerInfo.encrypt = false;  // ปิดการเข้ารหัสเพื่อความเร็วและความง่ายในการทดสอบ
@@ -111,67 +122,92 @@ void setup() {
     Serial.println("Error: Failed to add Peer");
     return;
   }
+   // -----------------------------------------------------------------------------------------------------------------------
 }
 
 void loop() {
-  // --- 1. DATA ACQUISITION (BNO055) ---
-  if (myData.bno_online) {
+  // --- 1. DATA (BNO055) ---
+  if (sent_sensorData.bno_online) {
     sensors_event_t event;
     bno.getEvent(&event);
-    // อ่านค่าองศา (Euler Angles)
-    myData.heading = event.orientation.x; // ทิศเหนือแม่เหล็ก (0-360°)
-    myData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
-    myData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
+    sent_sensorData.direction = event.orientation.x; // ทิศเหนือแม่เหล็ก (0-360°)
+    sent_sensorData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
+    sent_sensorData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
+
+
+
+
+    sent_sensorData.battery = 100;
+    sent_sensorData.speed = 0;
   }
 
-  // --- 2. DATA ACQUISITION (BMP280) ---
-  if (myData.bmp_online) {
-    myData.temperature = bmp.readTemperature();       // อุณหภูมิ
-    myData.pressure    = bmp.readPressure() / 100.0F; // แปลงหน่วย Pascal เป็น hPa (hectopascal)
+  // --- 2. DATA (BMP280) ---
+  if (sent_sensorData.bmp_online) {
+    sent_sensorData.temperature = bmp.readTemperature();       // อุณหภูมิ
+    sent_sensorData.pressure    = bmp.readPressure() / 100.0F; // แปลงหน่วย Pascal เป็น hPa (hectopascal)
     
     /**
      * [Depth Calculation Logic]
      * สูตรพื้นฐาน: ทุกๆ 1 hPa ที่เพิ่มขึ้นเหนือบิเวณผิวน้ำ (Standard 1013.25)
      * จะประมาณค่าความลึกได้ (ในการใช้งานจริงต้องปรับจูนสูตรตามความเค็มหรือแรงดันผิวน้ำขณะนั้น)
      */
-    myData.depth = (myData.pressure - 1013.25) * 0.01; 
+    // sent_sensorData.depth = (sent_sensorData.pressure - 1013.25) * 0.01; 
+    sent_sensorData.depth = 40;
   }
 
   // --- 3. SYNCHRONIZATION ---
   static uint32_t p_id = 0;
-  myData.packet_id = p_id++; // เพิ่มเลข ID ไปเรื่อยๆ เพื่อให้ฝั่งรับรู้ว่าข้อมูลมีการเคลื่อนไหว
+  sent_sensorData.packet_id = p_id++; // เพิ่มเลข ID ไปเรื่อยๆ เพื่อให้ฝั่งรับรู้ว่าข้อมูลมีการเคลื่อนไหว
 
   // --- 4. WIRELESS TRANSMISSION ---
   // ส่งข้อมูลดิบทั้งก้อน (struct) ผ่าน ESP-NOW
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &sent_sensorData, sizeof(sent_sensorData));
   
+
+
+
+
+
+
+
+
+
+
   // --- 5. DIAGNOSTIC PRINT (FOR DEBUGGING) ---
   // ส่วนนี้ใช้สำหรับดูผ่านหน้าจอคอมพิวเตอร์เท่านั้น ไม่เกี่ยวข้องกับการส่งข้อมูล
-  Serial.printf("\n[PACKET #%u]\n", myData.packet_id);
-  
+  Serial.printf("\n[PACKET #%u]\n", sent_sensorData.packet_id);
+  Serial.println("================================\n");
   // ข้อมูล BNO055
   Serial.println("--- BNO055 (IMU) ---");
-  if (myData.bno_online) {
-    Serial.printf("Heading (Yaw):  %.2f°\n", myData.heading);
-    Serial.printf("Pitch:          %.2f°\n", myData.pitch);
-    Serial.printf("Roll:           %.2f°\n", myData.roll);
+  if (sent_sensorData.bno_online) {
+    Serial.printf("Direction (Yaw):  %.2f°\n", sent_sensorData.direction);
+    Serial.printf("Pitch:          %.2f°\n", sent_sensorData.pitch);
+    Serial.printf("Roll:           %.2f°\n", sent_sensorData.roll);
   } else {
     Serial.println("❌ BNO055 OFFLINE");
   }
   
   // ข้อมูล BMP280
   Serial.println("\n--- BMP280 (Barometer) ---");
-  if (myData.bmp_online) {
-    Serial.printf("Temperature:    %.2f °C\n", myData.temperature);
-    Serial.printf("Pressure:       %.2f hPa\n", myData.pressure);
-    Serial.printf("Depth:          %.2f m\n", myData.depth);
+  if (sent_sensorData.bmp_online) {
+    Serial.printf("Temperature:    %.2f °C\n", sent_sensorData.temperature);
+    Serial.printf("Pressure:       %.2f hPa\n", sent_sensorData.pressure);
+    Serial.printf("Depth:          %.2f m\n", sent_sensorData.depth);
   } else {
     Serial.println("❌ BMP280 OFFLINE");
   }
 
+
+  // ข้อมูลอื่นๆ
+  Serial.println("\n--- Other Data ---");
+  Serial.printf("Battery:        %u%%\n", sent_sensorData.battery);
+  Serial.printf("Speed:          %.2f m/s\n", sent_sensorData.speed);
+
+
+
   // สถานะการทำงาน
   Serial.println("\n--- Status ---");
-  Serial.printf("Packet ID:      %u\n", myData.packet_id);
+  Serial.printf("Packet ID:      %u\n", sent_sensorData.packet_id);
   Serial.printf("ESP-NOW Status: %s\n", (result == ESP_OK ? "✓ SENT" : "✗ FAILED"));
   Serial.println("================================\n");
 
