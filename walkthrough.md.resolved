@@ -1,0 +1,45 @@
+# Integrated Motor & Sensor Node Walkthrough
+
+I have integrated the BTS7960 motor driver control into your ESP32 Sensor Node. The system now supports both sensor data transmission (ESP-NOW) and motor speed control via physical buttons or Serial commands.
+
+## Changes Made
+- **Motor Pins (ESP32):** RPWM(12), LPWM(13), R_EN(14), L_EN(27).
+- **Button Pins (ESP32):** UP(4), DOWN(15).
+- **Inverted Logic:** Set to `true` (255 = Stop, 0 = Spin) as requested.
+- **ESP-NOW Sync:** The `sent_sensorData.speed` now transmits the current `speedLevel` (0-3).
+- **Security Fix:** Removed hardcoded `speed = 0` overwrites that were present in the previous sensor logic.
+
+## Wiring Guide (ESP32)
+
+### 1. BTS7960 Motor Driver
+| BTS7960 Pin | ESP32 Pin | Note |
+|---|---|---|
+| **RPWM** | GPIO 12 | PWM Signal for Forward |
+| **LPWM** | GPIO 13 | Held HIGH for Forward (Inverted Logic) |
+| **R_EN** | GPIO 14 | Enable Right Side |
+| **L_EN** | GPIO 27 | Enable Left Side |
+| **VCC** | **Vin / 5V** | Logic Power (from USB) |
+| **GND** | GND | Common Ground |
+
+> [!NOTE]
+> **Logic Voltage:** แม้บอร์ด ESP32 จะทำงานที่ 3.3V แต่ขา Input ของ BTS7960 ส่วนใหญ่รองรับสัญญาณ 3.3V (TTL Compatible) ได้ และขา VCC ของโมดูลขับมอเตอร์ควรต่อเข้ากับขา **Vin** หรือ **5V** ของ ESP32 (ซึ่งจะมีไฟ 5V เมื่อเสียบสาย USB) เพื่อให้วงจรตรรกะทำงานได้เสถียรครับ
+
+### 2. Buttons
+- **Button UP:** Connect between **GPIO 4** and **GND**.
+- **Button DOWN:** Connect between **GPIO 15** and **GND**.
+- *Note: Internal pull-ups are enabled in code.*
+
+### 3. Sensors (Existing)
+- **I2C SDA:** GPIO 21
+- **I2C SCL:** GPIO 22
+
+## How to Control
+1. **Physical Buttons:**
+   - Press **BTN_UP (GPIO 4)** to increase speed level (0 -> 1 -> 2 -> 3 -> 0).
+   - Press **BTN_DOWN (GPIO 15)** to decrease speed level.
+2. **Serial Monitor (115200 baud):**
+   - Type `1`, `2`, `3` or `0` for direct speed control.
+   - Type `+` or `-` for sequential gear control.
+
+> [!WARNING]
+> **Safety First:** As noted in your previous warning, ensure you use **12AWG/14AWG** wires for motor and battery connections to prevent melting.

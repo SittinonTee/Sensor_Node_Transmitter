@@ -23,6 +23,64 @@
 #include <Adafruit_BNO055.h> // IMU Sensor: วัดแรงดึงดูดโลกและสนามแม่เหล็กเพื่อหาทิศทาง
 #include <Adafruit_BMP280.h> // Barometric Sensor: วัดความดันอากาศ/น้ำเพื่อหาความลึก
 
+
+
+
+
+
+
+// --- [BTS7960 (IBT-2) Pins for ESP32] ---
+const int RPWM = 12;  
+const int LPWM = 13;  
+const int R_EN = 14;  
+const int L_EN = 27;  
+
+// --- [Physical Button Pins for ESP32] ---
+const int BTN_UP   = 4;
+const int BTN_DOWN = 15;
+
+// --- [Motor Logic Config] ---
+const bool INVERT_LOGIC = true; 
+int speedLevel = 0;      // Target gear level (0-3)
+int targetPWM  = 0;      // Target PWM value
+float currentPWM = 0;    // Current PWM value (smooth ramping)
+const float RAMP_STEP = 5.0; // Speed of ramping (higher = faster)
+
+// --- [Button Debounce Variables] ---
+bool lastUpState   = HIGH;
+bool lastDownState = HIGH;
+unsigned long lastDebounceTime = 0;
+const int debounceDelay = 250; 
+
+// --- [Timing Variables] ---
+unsigned long lastSensorUpdate = 0;
+const int SENSOR_INTERVAL = 200; // Send sensor data every 200ms
+unsigned long lastMotorUpdate = 0;
+const int MOTOR_RAMP_INTERVAL = 20; // Update ramping every 20ms
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // --- [MAC Address Configuration] ---
 /**
  * broadcastAddress: เลขที่อยู่ประจำตัวบอร์ดรับสัญญาณ (Main Board)
@@ -42,7 +100,8 @@ typedef struct {
 
     // ยังไม่ได้ใช้
     int battery;        // [อุปกรณ์] ค่าแบตเตอรี่ (เปอร์เซ็นต์)
-    int speed;        // [ความเร็ว] เผื่อไว้สำหรับการคำนวณในอนาคต
+    int gear;           // [เกียร์] ระดับ 0, 1, 2, 3
+    int speed;          // [ความเร็ว] 0, 2, 4, 6 (m/s หรือหน่วยอื่นๆ)
     float pressure;     // [ความดัน] หน่วยเป็น hPa
     float depth;          // [ความลึก] หน่วยเป็นเมตร (m) คำนวณจากความดัน
 
@@ -118,14 +177,95 @@ void setup() {
   peerInfo.encrypt = false;  // ปิดการเข้ารหัสเพื่อความเร็วและความง่ายในการทดสอบ
   
   // เพิ่มบอร์ดรับเข้าไปในรายการที่บอร์ดนี้จะคุยด้วย
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Error: Failed to add Peer");
+  esp_err_t addStatus = esp_now_add_peer(&peerInfo);
+  if (addStatus != ESP_OK){
+    Serial.printf("Error: Failed to add Peer (Error Code: 0x%X)\n", addStatus);
     return;
   }
    // -----------------------------------------------------------------------------------------------------------------------
+
+  // --- 3. MOTOR & BUTTON SETUP ---
+  pinMode(RPWM, OUTPUT);
+  pinMode(LPWM, OUTPUT);
+  pinMode(R_EN, OUTPUT);
+  pinMode(L_EN, OUTPUT);
+
+  // Buttons with internal pull-ups (connect button to GND)
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+
+  // Enable Driver
+  digitalWrite(R_EN, HIGH);
+  digitalWrite(L_EN, HIGH);
+
+  // Set initial stopped state for inverted logic
+  if (INVERT_LOGIC) {
+    analogWrite(RPWM, 255);
+    analogWrite(LPWM, 255);
+  } else {
+    analogWrite(RPWM, 0);
+    analogWrite(LPWM, 0);
+  }
+
+  Serial.println("BTS7960 Controller (Button + Sequential Mode)");
+  Serial.println("BTN 4: UP | BTN 15: DOWN | Serial: 0-3, +, -");
+  // -----------------------------------------------------------------------------------------------------------------------
 }
 
 void loop() {  
+  // --- 4. CONTINUOUS MOTOR RAMPING ---
+  handleMotorRamping();
+
+  // -----------------------------------------------------------------------------------------------------------------------
+  // --- 0. MOTOR CONTROL (Serial & Buttons) ---
+  
+  // 1. Serial Control
+  if (Serial.available()) {
+    char ch = Serial.read();
+    
+    // Direct Number Keys
+    if (ch == '1')      speedLevel = 1;
+    else if (ch == '2') speedLevel = 2;
+    else if (ch == '3') speedLevel = 3;
+    else if (ch == '0') speedLevel = 0;
+    
+    // Sequential Gear Control (Cycling)
+    else if (ch == '+') {
+      speedLevel = (speedLevel + 1) % 4;
+    }
+    else if (ch == '-') {
+      speedLevel = (speedLevel > 0) ? (speedLevel - 1) : 3;
+    }
+
+    updateMotor();
+  }
+
+  // 2. Physical Button Control (Improved Debounce)
+  bool upState   = digitalRead(BTN_UP);
+  bool downState = digitalRead(BTN_DOWN);
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // Button UP pressed
+    if (upState == LOW && lastUpState == HIGH) {
+      speedLevel = (speedLevel + 1) % 4;
+      updateMotor();
+      lastDebounceTime = millis();
+    }
+    // Button DOWN pressed
+    else if (downState == LOW && lastDownState == HIGH) {
+      speedLevel = (speedLevel > 0) ? (speedLevel - 1) : 3;
+      updateMotor();
+      lastDebounceTime = millis();
+    }
+  }
+  lastUpState   = upState;
+  lastDownState = downState;
+
+  // Sync to sent_sensorData
+  sent_sensorData.gear  = speedLevel;
+  sent_sensorData.speed = speedLevel * 2;
+  // -----------------------------------------------------------------------------------------------------------------------
+
    // เช็ค BMP280 (0x76)
   Wire.beginTransmission(0x76);
   bool bmp_present = (Wire.endTransmission() == 0);
@@ -139,7 +279,6 @@ void loop() {
     sent_sensorData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.battery = 100;
-    sent_sensorData.speed = 0;
   }
 
  
@@ -162,7 +301,6 @@ void loop() {
 
   // --- 3. OTHER DATA ---
   sent_sensorData.battery = 100; // Simulated battery
-  sent_sensorData.speed   = 0;   // Simulated speed
   sent_sensorData.depth   = 40.0; // Hardcoded depth as per requirement
 
 
@@ -189,45 +327,107 @@ void loop() {
 
 
 
-  // --- 5. DIAGNOSTIC PRINT (FOR DEBUGGING) ---
-  // ส่วนนี้ใช้สำหรับดูผ่านหน้าจอคอมพิวเตอร์เท่านั้น ไม่เกี่ยวข้องกับการส่งข้อมูล
-  Serial.printf("\n[PACKET #%u]\n", sent_sensorData.packet_id);
-  Serial.println("================================\n");
-  // ข้อมูล BNO055
-  Serial.println("--- BNO055 (IMU) ---");
-  if (sent_sensorData.bno_online) {
-    Serial.printf("Direction (Yaw):  %.2f°\n", sent_sensorData.direction);
-    Serial.printf("Pitch:          %.2f°\n", sent_sensorData.pitch);
-    Serial.printf("Roll:           %.2f°\n", sent_sensorData.roll);
-  } else {
-    Serial.println("❌ BNO055 OFFLINE");
+  // --- 5. PERIODIC SENSOR DATA TRANSMISSION ---
+  if (millis() - lastSensorUpdate >= SENSOR_INTERVAL) {
+    lastSensorUpdate = millis();
+
+    // ส่วนนี้ใช้สำหรับดูผ่านหน้าจอคอมพิวเตอร์เท่านั้น ไม่เกี่ยวข้องกับการส่งข้อมูล
+    Serial.printf("\n[PACKET #%u]\n", sent_sensorData.packet_id);
+    Serial.println("================================\n");
+    // ข้อมูล BNO055
+    Serial.println("--- BNO055 (IMU) ---");
+    if (sent_sensorData.bno_online) {
+      Serial.printf("Direction (Yaw):  %.2f°\n", sent_sensorData.direction);
+      Serial.printf("Pitch:          %.2f°\n", sent_sensorData.pitch);
+      Serial.printf("Roll:           %.2f°\n", sent_sensorData.roll);
+    } else {
+      Serial.println("❌ BNO055 OFFLINE");
+    }
+    
+    // ข้อมูล BMP280
+    Serial.println("\n--- BMP280 (Barometer) ---");
+    if (sent_sensorData.bmp_online) {
+      Serial.printf("Temperature:    %.2f °C\n", sent_sensorData.temperature);
+      Serial.printf("Pressure:       %.2f hPa\n", sent_sensorData.pressure);
+      Serial.printf("Depth:          %.2f m\n", sent_sensorData.depth);
+    } else {
+      Serial.println("❌ BMP280 OFFLINE");
+    }
+
+
+    // ข้อมูลอื่นๆ
+    Serial.println("\n--- Other Data ---");
+    Serial.printf("Battery:        %u%%\n", sent_sensorData.battery);
+    Serial.printf("Gear:           %d\n", sent_sensorData.gear);
+    Serial.printf("Speed:          %d m/s\n", sent_sensorData.speed);
+
+
+
+    // สถานะการทำงาน
+    Serial.println("\n--- Status ---");
+    Serial.printf("Packet ID:      %u\n", sent_sensorData.packet_id);
+    if (result == ESP_OK) {
+      Serial.println("ESP-NOW Status: ✓ SENT");
+    } else {
+      Serial.printf("ESP-NOW Status: ✗ FAILED (Error Code: 0x%X)\n", result);
+      // common errors: 0x3011 (NOT_FOUND - MAC Incorrect), 0x3010 (ARG - Size/Param)
+    }
+    Serial.println("================================\n");
   }
-  
-  // ข้อมูล BMP280
-  Serial.println("\n--- BMP280 (Barometer) ---");
-  if (sent_sensorData.bmp_online) {
-    Serial.printf("Temperature:    %.2f °C\n", sent_sensorData.temperature);
-    Serial.printf("Pressure:       %.2f hPa\n", sent_sensorData.pressure);
-    Serial.printf("Depth:          %.2f m\n", sent_sensorData.depth);
-  } else {
-    Serial.println("❌ BMP280 OFFLINE");
+}
+
+/**
+ * updateMotor: ตั้งค่าความเร็วเป้าหมายที่จะค่อยๆ ramp ไปหา
+ */
+void updateMotor() {
+  if (speedLevel == 1)      targetPWM = 80;
+  else if (speedLevel == 2) targetPWM = 160;
+  else if (speedLevel == 3) targetPWM = 255;
+  else                      targetPWM = 0;
+
+  Serial.print("--- Command: Gear "); Serial.print(speedLevel);
+  Serial.print(" | Target Speed: "); Serial.print(speedLevel * 2);
+  Serial.print(" | Target PWM: "); Serial.println(targetPWM);
+}
+
+/**
+ * handleMotorRamping: ฟังก์ชันที่ถูกเรียกใน loop ตลอดเวลาเพื่อค่อยๆ ปรับความเร็ว
+ */
+void handleMotorRamping() {
+  if (millis() - lastMotorUpdate < MOTOR_RAMP_INTERVAL) return;
+  lastMotorUpdate = millis();
+
+  // Logic: ถ้าความเร็วปัจจุบันยังไม่ถึงเป้าหมาย ให้ขยับเข้าหา
+  if (currentPWM < targetPWM) {
+    currentPWM += RAMP_STEP;
+    if (currentPWM > targetPWM) currentPWM = targetPWM;
+  } 
+  else if (currentPWM > targetPWM) {
+    currentPWM -= RAMP_STEP;
+    if (currentPWM < targetPWM) currentPWM = targetPWM;
+  }
+  else {
+    return; // ความเร็วถึงเป้าหมายแล้ว ไม่ต้องเขียน analogWrite ซ้ำ
   }
 
+  // ส่งค่าที่คำนวณได้ไปยังมอเตอร์ (BTS7960)
+  int pwmValue = (int)currentPWM;
 
-  // ข้อมูลอื่นๆ
-  Serial.println("\n--- Other Data ---");
-  Serial.printf("Battery:        %u%%\n", sent_sensorData.battery);
-  Serial.printf("Speed:          %.2f m/s\n", sent_sensorData.speed);
-
-
-
-  // สถานะการทำงาน
-  Serial.println("\n--- Status ---");
-  Serial.printf("Packet ID:      %u\n", sent_sensorData.packet_id);
-  Serial.printf("ESP-NOW Status: %s\n", (result == ESP_OK ? "✓ SENT" : "✗ FAILED"));
-  Serial.println("================================\n");
-
-  delay(200); // หน่วงเวลา 200ms (ส่งข้อมูล 5 ครั้งต่อวินาที)
+  if (pwmValue == 0) {
+    if (INVERT_LOGIC) {
+      analogWrite(RPWM, 255);
+      analogWrite(LPWM, 255);
+    } else {
+      analogWrite(RPWM, 0);
+      analogWrite(LPWM, 0);
+    }
+  } 
+  else {
+    int activePWM = INVERT_LOGIC ? (255 - pwmValue) : pwmValue;
+    int staticPin = INVERT_LOGIC ? 255 : 0;
+    analogWrite(LPWM, staticPin);
+    analogWrite(RPWM, activePWM);
+  }
 }
 
 
