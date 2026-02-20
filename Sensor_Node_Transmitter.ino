@@ -39,6 +39,11 @@ const int L_EN = 27;
 const int BTN_UP   = 4;
 const int BTN_DOWN = 15;
 
+// --- [External Pressure Sensor (GPIO 34)] ---
+#define PRESS_DATA_PIN 34
+float extActualVoltage = 0;
+float extPressureBar = 0;
+
 // --- [Motor Logic Config] ---
 const bool INVERT_LOGIC = true; 
 int speedLevel = 0;      // Target gear level (0-3)
@@ -132,6 +137,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 void setup() {
   Serial.begin(115200);   // ตั้งค่าความเร็วสื่อสารกับคอมพิวเตอร์
+  analogSetAttenuation(ADC_11db); // Set ADC range to ~3.9V for External Pressure Sensor
   delay(1000);            // รอให้ Serial พร้อมทำงาน
   
   Serial.println("--- [DPV] SENSOR SLAVE NODES (VER 2.1) ---");
@@ -263,7 +269,7 @@ void loop() {
 
   // Sync to sent_sensorData
   sent_sensorData.gear  = speedLevel;
-  sent_sensorData.speed = speedLevel * 2;
+
   // -----------------------------------------------------------------------------------------------------------------------
 
    // เช็ค BMP280 (0x76)
@@ -279,6 +285,7 @@ void loop() {
     sent_sensorData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.battery = 100;
+    sent_sensorData.speed = -sent_sensorData.roll; // กลับค่า (Invert) เช่น -10 กลายเป็น 10
   }
 
  
@@ -288,11 +295,9 @@ void loop() {
   if (bmp_present && !isnan(t) && t < 150.0f) {
     sent_sensorData.bmp_online = true;
     sent_sensorData.temperature = t;
-    sent_sensorData.pressure    = bmp.readPressure() / 100.0F;
   } else {
     sent_sensorData.bmp_online = false;
     sent_sensorData.temperature = 0;
-    sent_sensorData.pressure    = 0;
     if (bmp_present) bmp.begin(0x76); // ถ้าสายยังอยู่แต่เอ๋อ ให้ลองเริ่มใหม่
   }
 
@@ -301,21 +306,35 @@ void loop() {
 
   // --- 3. OTHER DATA ---
   sent_sensorData.battery = 100; // Simulated battery
-  sent_sensorData.depth   = 40.0; // Hardcoded depth as per requirement
 
 
 
 
 
 
+
+  // --- 4. EXTERNAL PRESSURE SENSOR (GPIO 34) ---
+  int sensorValue = analogRead(PRESS_DATA_PIN); 
+  // Convert ADC to voltage (approx 3.3V reference)
+  // divider_ratio = 20k / (10k + 20k) = 0.666
+  float voltageAtPin = sensorValue * (3.3 / 4095.0);
+  extActualVoltage = voltageAtPin / 0.666; // Compensate for divider
+
+  // Calculate Pressure (0-12 Bar range)
+  // Formula: (voltage - 0.5) * (12.0 / 4.0)
+  extPressureBar = (extActualVoltage - 0.5) * (12.0 / 4.0); 
+  if (extPressureBar < 0) extPressureBar = 0;
+
+  // Update sent_sensorData (Converting Bar to hPa and calculating Depth)
+  // 1 Bar = 1000 hPa | 1 Bar ~ 10.0 meters depth
+  sent_sensorData.pressure = extPressureBar * 1000.0f; // ตั้งค่าPressure คือค่า hPa
+  sent_sensorData.depth    = extPressureBar * 10.0f; // ตั้งค่าDepth คือค่าเมตร
 
   // --- 3. SYNCHRONIZATION ---
   static uint32_t p_id = 0;
   sent_sensorData.packet_id = p_id++; // เพิ่มเลข ID ไปเรื่อยๆ เพื่อให้ฝั่งรับรู้ว่าข้อมูลมีการเคลื่อนไหว
 
-  // --- 4. WIRELESS TRANSMISSION ---
-  // ส่งข้อมูลดิบทั้งก้อน (struct) ผ่าน ESP-NOW
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &sent_sensorData, sizeof(sent_sensorData));
+  // --- 4. WIRELESS TRANSMISSION (Move inside timer block below) ---
   
 
 
@@ -330,6 +349,9 @@ void loop() {
   // --- 5. PERIODIC SENSOR DATA TRANSMISSION ---
   if (millis() - lastSensorUpdate >= SENSOR_INTERVAL) {
     lastSensorUpdate = millis();
+
+    // ส่งข้อมูลดิบทั้งก้อน (struct) ผ่าน ESP-NOW
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &sent_sensorData, sizeof(sent_sensorData));
 
     // ส่วนนี้ใช้สำหรับดูผ่านหน้าจอคอมพิวเตอร์เท่านั้น ไม่เกี่ยวข้องกับการส่งข้อมูล
     Serial.printf("\n[PACKET #%u]\n", sent_sensorData.packet_id);
@@ -348,8 +370,6 @@ void loop() {
     Serial.println("\n--- BMP280 (Barometer) ---");
     if (sent_sensorData.bmp_online) {
       Serial.printf("Temperature:    %.2f °C\n", sent_sensorData.temperature);
-      Serial.printf("Pressure:       %.2f hPa\n", sent_sensorData.pressure);
-      Serial.printf("Depth:          %.2f m\n", sent_sensorData.depth);
     } else {
       Serial.println("❌ BMP280 OFFLINE");
     }
@@ -360,6 +380,9 @@ void loop() {
     Serial.printf("Battery:        %u%%\n", sent_sensorData.battery);
     Serial.printf("Gear:           %d\n", sent_sensorData.gear);
     Serial.printf("Speed:          %d m/s\n", sent_sensorData.speed);
+    Serial.printf("Ext Voltage:    %.2f V\n", extActualVoltage);
+    Serial.printf("Pressure:   %.2f Bar\n", sent_sensorData.pressure);
+    Serial.printf("Depth:          %.2f m\n", sent_sensorData.depth);
 
 
 
