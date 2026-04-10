@@ -22,6 +22,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h> // IMU Sensor: วัดแรงดึงดูดโลกและสนามแม่เหล็กเพื่อหาทิศทาง
 #include <Adafruit_BMP280.h> // Barometric Sensor: วัดความดันอากาศ/น้ำเพื่อหาความลึก
+#include <ESP32Servo.h>      // Library ควบคุม ESC (ควบคุมสัญญาณรูปคลื่น 50Hz PWM)
 
 
 
@@ -29,11 +30,9 @@
 
 
 
-// --- [BTS7960 (IBT-2) Pins for ESP32] ---
-const int RPWM = 12;  
-const int LPWM = 13;  
-const int R_EN = 14;  
-const int L_EN = 27;  
+// --- [Hobbywing Skywalker 60A V2 ESC Pins for ESP32] ---
+const int ESC_PIN = 27;  // ย้ายมาใช้ขา 27 แทน (เพื่อหนีขา 12/14 ที่อาจจะไหม้ไปแล้ว)
+Servo esc;               // ตัวแปรสำหรับควบคุม ESC
 
 // --- [Physical Button Pins for ESP32] ---
 const int BTN_UP   = 4;
@@ -44,12 +43,11 @@ const int BTN_DOWN = 15;
 float extActualVoltage = 0;
 float extPressureBar = 0;
 
-// --- [Motor Logic Config] ---
-const bool INVERT_LOGIC = true; 
-int speedLevel = 0;      // Target gear level (0-3)
-int targetPWM  = 0;      // Target PWM value
-float currentPWM = 0;    // Current PWM value (smooth ramping)
-const float RAMP_STEP = 5.0; // Speed of ramping (higher = faster)
+// --- [Motor Logic Config (ESC)] ---
+int speedLevel = 0;          // Target gear level (0-3)
+int targetPWM  = 1000;       // Target PWM value (1000 = Stop, 2000 = Full Throttle)
+float currentPWM = 1000.0;   // Current PWM value (smooth ramping)
+const float RAMP_STEP = 20.0; // Speed of ramping (เพิ่มขั้นละ 20us ทุก 20ms)
 
 // --- [Button Debounce Variables] ---
 bool lastUpState   = HIGH;
@@ -158,6 +156,13 @@ void setup() {
   // --- 2. ESP-NOW SETUP ---
   WiFi.mode(WIFI_STA); // ต้องอยู่ในโหมด Station เพื่อให้ Driver ของ WiFi ทำงาน
   
+  // ⚡ [แก้ปัญหาหลุดบ่อยตอนอยู่นิ่งๆ] ปิดโหมดประหยัดพลังงานของ WiFi (Modem Sleep) 
+  // ถ้าไม่ปิด ESP32 จะชอบแอบหลับ ทำให้ส่งข้อมูลสะดุดหรือช้า
+  esp_wifi_set_ps(WIFI_PS_NONE); 
+  
+  // ⚡ [ป้องกันลูปค้าง] ตั้งเวลา TimeOut ให้สายเซนเซอร์ I2C ป้องกันการค้างจนส่งข้อมูลไม่ออก
+  Wire.setTimeOut(150);
+
   /**
    * [Channel Locking Mechanism]
    * ESP-NOW จะเสถียรที่สุดถ้าส่งและรับอยู่ในช่องสัญญาณ (Channel) เดียวกัน
@@ -191,29 +196,30 @@ void setup() {
    // -----------------------------------------------------------------------------------------------------------------------
 
   // --- 3. MOTOR & BUTTON SETUP ---
-  pinMode(RPWM, OUTPUT);
-  pinMode(LPWM, OUTPUT);
-  pinMode(R_EN, OUTPUT);
-  pinMode(L_EN, OUTPUT);
-
   // Buttons with internal pull-ups (connect button to GND)
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
 
-  // Enable Driver
-  digitalWrite(R_EN, HIGH);
-  digitalWrite(L_EN, HIGH);
+  // ESC Initialization
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  esc.setPeriodHertz(50); // เซ็ตความถี่ 50Hz มาตรฐานสำหรับ ESC
+  esc.attach(ESC_PIN, 1000, 2000); // กำหนดช่วง Pulse: 1000us (Stop) ถึง 2000us (Full)
+  
+  /* 
+   * 🆘 [วิธีเช็คอาการมอเตอร์ร้องไม่หยุด (ESC Beeping Troubleshooting)]
+   * 1. ร้อง ปี๊บ... ปี๊บ... (ห่างๆ) -> ESC ตรวจไม่พบสัญญาณ: เช็คสายสีขาวว่าต่อเข้า GPIO12 หรือไม่ และ "สายสีดำต้องต่อ GND ด้วยเสมอ!"
+   * 2. ร้อง ปี๊บๆๆๆๆๆ (รัวๆ) -> คันเร่งค้าง: ค่า 1000us อาจสูงไปสำหรับ ESC ตัวนี้ ให้ลองลดเลข 1000 ตัวล่างเป็น 900 หรือ 800
+   * 3. ถ้าร้องรัวๆ แล้วลดเลขก็ยังไม่หาย -> ESC จำค่าคันเร่งผิด ให้สลับไปรันไฟล์ ESC_Calibration.ino เพื่อสอนระยะคันเร่ง 1 ครั้ง
+   */
 
-  // Set initial stopped state for inverted logic
-  if (INVERT_LOGIC) {
-    analogWrite(RPWM, 255);
-    analogWrite(LPWM, 255);
-  } else {
-    analogWrite(RPWM, 0);
-    analogWrite(LPWM, 0);
-  }
+  // Arming ESC: ส่งสัญญาณคันเร่งต่ำสุด (0%) ให้ ESC เพื่อปลดล็อกความปลอดภัย
+  esc.writeMicroseconds(1000);
+  delay(2000); // หน่วงเวลา 2 วินาทีให้ ESC ได้ยินสัญญาณ Arm อย่างชัดเจน (จนกว่าจะร้อง ตื๊ดๆๆ ครบ)
 
-  Serial.println("BTS7960 Controller (Button + Sequential Mode)");
+  Serial.println("Hobbywing Skywalker 60A V2 ESC Controller");
   Serial.println("BTN 4: UP | BTN 15: DOWN | Serial: 0-3, +, -");
   // -----------------------------------------------------------------------------------------------------------------------
 }
@@ -315,15 +321,26 @@ void loop() {
 
   // --- 4. EXTERNAL PRESSURE SENSOR (GPIO 34) ---
   int sensorValue = analogRead(PRESS_DATA_PIN); 
-  // Convert ADC to voltage (approx 3.3V reference)
-  // divider_ratio = 20k / (10k + 20k) = 0.666
-  float voltageAtPin = sensorValue * (3.3 / 4095.0);
-  extActualVoltage = voltageAtPin / 0.666; // Compensate for divider
+  
+  // 1. อ่านค่า ADC และแปลงเป็นแรงดันดิบ
+  float rawVoltageAtPin = sensorValue * (3.3 / 4095.0);
+  float rawActualVoltage = rawVoltageAtPin / 0.666; // ชดเชยแรงดันที่หายไปจาก 10k/20k
+  
+  // 2. ⚡ [ระบบกรองสัญญาณรบกวน (EMA Filter)]
+  // สมูทค่าไฟที่แกว่งไปมา (ดึงค่าเก่า 90% รับค่าใหม่แค่ 10%) เพื่อลดอาการเลขกระโดด
+  static float smoothedVoltage = 0.5; // ค่าเริ่มต้นที่ 0 บาร์ (0.5V)
+  smoothedVoltage = (smoothedVoltage * 0.90) + (rawActualVoltage * 0.10);
+  extActualVoltage = smoothedVoltage;
 
-  // Calculate Pressure (0-12 Bar range)
-  // Formula: (voltage - 0.5) * (12.0 / 4.0)
+  // 3. คำนวณความดัน (0-12 Bar range => สมการ: (V - 0.5) * (12.0 / 4.0))
   extPressureBar = (extActualVoltage - 0.5) * (12.0 / 4.0); 
-  if (extPressureBar < 0) extPressureBar = 0;
+
+  // 4. ⚡ [ตั้งค่าจุดบอด (Deadzone / Snap-to-Zero)]
+  // บอร์ด ESP32 มีคลื่นกวนที่ทำให้เลขแกว่งประมาณ 1-2 เมตรเสมอตอนอยู่บนบก
+  // สเกลเซนเซอร์รองรับถึง 120 เมตร เราจึงตัดความลึกจุกจิกที่น้อยกว่า 1.8 เมตรทิ้งเป็น 0 (ผิวน้ำ)
+  if (extPressureBar < 0.18) {
+    extPressureBar = 0.0;
+  }
 
   // Update sent_sensorData (Converting Bar to hPa and calculating Depth)
   // 1 Bar = 1000 hPa | 1 Bar ~ 10.0 meters depth
@@ -403,14 +420,14 @@ void loop() {
  * updateMotor: ตั้งค่าความเร็วเป้าหมายที่จะค่อยๆ ramp ไปหา
  */
 void updateMotor() {
-  if (speedLevel == 1)      targetPWM = 80;
-  else if (speedLevel == 2) targetPWM = 160;
-  else if (speedLevel == 3) targetPWM = 255;
-  else                      targetPWM = 0;
+  if (speedLevel == 1)      targetPWM = 1330; // ~33%
+  else if (speedLevel == 2) targetPWM = 1660; // ~66%
+  else if (speedLevel == 3) targetPWM = 2000; // 100%
+  else                      targetPWM = 1000; // 0% (หยุดหล่อลื่น)
 
   Serial.print("--- Command: Gear "); Serial.print(speedLevel);
   Serial.print(" | Target Speed: "); Serial.print(speedLevel * 2);
-  Serial.print(" | Target PWM: "); Serial.println(targetPWM);
+  Serial.print(" | Target PWM: "); Serial.print(targetPWM); Serial.println(" us");
 }
 
 /**
@@ -430,27 +447,11 @@ void handleMotorRamping() {
     if (currentPWM < targetPWM) currentPWM = targetPWM;
   }
   else {
-    return; // ความเร็วถึงเป้าหมายแล้ว ไม่ต้องเขียน analogWrite ซ้ำ
+    return; // ความเร็วถึงเป้าหมายแล้ว ไม่ต้องเขียนสัญญาณซ้ำเพื่อลดภาระ CPU
   }
 
-  // ส่งค่าที่คำนวณได้ไปยังมอเตอร์ (BTS7960)
-  int pwmValue = (int)currentPWM;
-
-  if (pwmValue == 0) {
-    if (INVERT_LOGIC) {
-      analogWrite(RPWM, 255);
-      analogWrite(LPWM, 255);
-    } else {
-      analogWrite(RPWM, 0);
-      analogWrite(LPWM, 0);
-    }
-  } 
-  else {
-    int activePWM = INVERT_LOGIC ? (255 - pwmValue) : pwmValue;
-    int staticPin = INVERT_LOGIC ? 255 : 0;
-    analogWrite(LPWM, staticPin);
-    analogWrite(RPWM, activePWM);
-  }
+  // ส่งค่าที่คำนวณได้ไปยัง ESC (หน่วย Microseconds)
+  esc.writeMicroseconds((int)currentPWM);
 }
 
 
