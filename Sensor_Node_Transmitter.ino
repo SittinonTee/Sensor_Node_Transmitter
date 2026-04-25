@@ -35,8 +35,8 @@ const int ESC_PIN = 27;  // ย้ายมาใช้ขา 27 แทน (เ�
 Servo esc;               // ตัวแปรสำหรับควบคุม ESC
 
 // --- [Physical Button Pins for ESP32] ---
-const int BTN_UP   = 4;
-const int BTN_DOWN = 15;
+const int BTN_RUN   = 4;  // กดค้างเพื่อทำงาน
+const int BTN_GEAR  = 15; // กดเพื่อเปลี่ยนเกียร์ (1-3)
 
 // --- [External Pressure Sensor (GPIO 34)] ---
 #define PRESS_DATA_PIN 34
@@ -44,16 +44,17 @@ float extActualVoltage = 0;
 float extPressureBar = 0;
 
 // --- [Motor Logic Config (ESC)] ---
-int speedLevel = 0;          // Target gear level (0-3)
+int selectedGear = 1;        // Target gear level (1-3)
+bool isRunning = false;      // Motor running state
 int targetPWM  = 1000;       // Target PWM value (1000 = Stop, 2000 = Full Throttle)
 float currentPWM = 1000.0;   // Current PWM value (smooth ramping)
-const float RAMP_STEP = 20.0; // Speed of ramping (เพิ่มขั้นละ 20us ทุก 20ms)
+const float RAMP_STEP = 5.0;  // Speed of ramping (เพิ่มขั้นละ 5us ทุก 20ms เพื่อลดการกระชาก)
 
 // --- [Button Debounce Variables] ---
-bool lastUpState   = HIGH;
-bool lastDownState = HIGH;
+bool lastGearState = HIGH;
+bool steadyGearState = HIGH;
 unsigned long lastDebounceTime = 0;
-const int debounceDelay = 250; 
+const int debounceDelay = 50; 
 
 // --- [Timing Variables] ---
 unsigned long lastSensorUpdate = 0;
@@ -127,6 +128,62 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 // BMP280: จะกำหนด address 0x76 ในตอน bno.begin()
 Adafruit_BMP280 bmp; 
 
+// --- [INA226 Battery Monitor (I2C 0x40)] ---
+float batteryVoltage = 0.0;
+float batteryCurrent = 0.0; // เก็บค่ากระแส (A)
+float batteryPower = 0.0;   // เก็บค่ากำลังไฟ (W)
+
+float readINA226BusVoltage() {
+  Wire.beginTransmission(0x40);
+  Wire.write(0x02); // Bus Voltage Register
+  
+  // ⚡ แก้ไขตรงนี้: ต้องใส่ false (Repeated Start) ไม่งั้น INA226 จะงงและพ่นค่า 0xFFFF ออกมา
+  if (Wire.endTransmission(false) != 0) {
+      // คืนค่าบัสให้กลับมาปกติถ้าหาไม่เจอ
+      Wire.endTransmission(true); 
+      return -1.0; 
+  }
+  
+  uint8_t bytesReceived = Wire.requestFrom((uint16_t)0x40, (uint8_t)2);
+  if (bytesReceived == 2) {
+    uint16_t value = (Wire.read() << 8) | Wire.read();
+    
+    // ถ้าพ่นค่า 0xFFFF มาอีก แสดงว่าเซ็นเซอร์ยังเอ๋ออยู่ (ตั้งเป็น error โค้ด -2.0)
+    if (value == 0xFFFF) return -2.0;
+    
+    return value * 0.00125f; // LSB = 1.25mV สำหรับ INA226
+  }
+  
+  Wire.endTransmission(true); 
+  return -1.0;
+} 
+
+float readINA226Current() {
+  Wire.beginTransmission(0x40);
+  Wire.write(0x01); // Shunt Voltage Register
+  if (Wire.endTransmission(false) != 0) {
+      Wire.endTransmission(true); 
+      return 0.0; 
+  }
+  
+  if (Wire.requestFrom((uint16_t)0x40, (uint8_t)2) == 2) {
+    int16_t value = (Wire.read() << 8) | Wire.read(); // INA226 ส่งค่ากลับมาแบบมีเครื่องหมาย (ติดลบได้)
+    
+    // คำนวณตามสเปค Shunt 100A / 75mV (ความต้านทาน = 0.00075 Ohms)
+    // LSB ของ INA226 = 2.5uV (0.0000025 V)
+    // สูตร: Current = (value * 2.5e-6) / 0.00075 = value * 0.0033333
+    float amps = value * 0.0033333f;
+    
+    // ถ้าค่ากระแสติดลบ (เกิดจากการสลับสาย IN+ กับ IN-) ให้แปลงเป็นค่าบวกอัตโนมัติ
+    if (amps < 0) amps = -amps;
+    
+    return amps;
+  }
+  
+  Wire.endTransmission(true); 
+  return 0.0;
+}
+
 // --- [Callback functions] ---
 // ฟังก์ชันนี้จะถูกเรียกอัตโนมัติเมื่อ ESP-NOW ส่งข้อมูลเสร็จ (ไม่ว่าจะสำเร็จหรือล้มเหลว)
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -197,8 +254,8 @@ void setup() {
 
   // --- 3. MOTOR & BUTTON SETUP ---
   // Buttons with internal pull-ups (connect button to GND)
-  pinMode(BTN_UP, INPUT_PULLUP);
-  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_RUN, INPUT_PULLUP);
+  pinMode(BTN_GEAR, INPUT_PULLUP);
 
   // ESC Initialization
   ESP32PWM::allocateTimer(0);
@@ -220,7 +277,7 @@ void setup() {
   delay(2000); // หน่วงเวลา 2 วินาทีให้ ESC ได้ยินสัญญาณ Arm อย่างชัดเจน (จนกว่าจะร้อง ตื๊ดๆๆ ครบ)
 
   Serial.println("Hobbywing Skywalker 60A V2 ESC Controller");
-  Serial.println("BTN 4: UP | BTN 15: DOWN | Serial: 0-3, +, -");
+  Serial.println("BTN 4: HOLD TO RUN | BTN 15: CHANGE GEAR");
   // -----------------------------------------------------------------------------------------------------------------------
 }
 
@@ -236,45 +293,50 @@ void loop() {
     char ch = Serial.read();
     
     // Direct Number Keys
-    if (ch == '1')      speedLevel = 1;
-    else if (ch == '2') speedLevel = 2;
-    else if (ch == '3') speedLevel = 3;
-    else if (ch == '0') speedLevel = 0;
+    if (ch == '1')      selectedGear = 1;
+    else if (ch == '2') selectedGear = 2;
+    else if (ch == '3') selectedGear = 3;
+    else if (ch == 'R' || ch == 'r') isRunning = !isRunning; // Toggle run state via Serial
     
     // Sequential Gear Control (Cycling)
     else if (ch == '+') {
-      speedLevel = (speedLevel + 1) % 4;
-    }
-    else if (ch == '-') {
-      speedLevel = (speedLevel > 0) ? (speedLevel - 1) : 3;
+      selectedGear = (selectedGear % 3) + 1; // 1 -> 2 -> 3 -> 1
     }
 
-    updateMotor();
+    updateMotorState();
   }
 
-  // 2. Physical Button Control (Improved Debounce)
-  bool upState   = digitalRead(BTN_UP);
-  bool downState = digitalRead(BTN_DOWN);
+  // 2. Physical Button Control
+  bool runState   = digitalRead(BTN_RUN);
+  bool gearState  = digitalRead(BTN_GEAR);
+
+  // Check run button (Hold to run)
+  bool currentStateRunning = (runState == LOW);
+  if (currentStateRunning != isRunning) {
+    isRunning = currentStateRunning;
+    updateMotorState();
+  }
+
+  // Check gear button (Press to cycle 1->2->3)
+  if (gearState != lastGearState) {
+    lastDebounceTime = millis();
+  }
 
   if ((millis() - lastDebounceTime) > debounceDelay) {
-    // Button UP pressed
-    if (upState == LOW && lastUpState == HIGH) {
-      speedLevel = (speedLevel + 1) % 4;
-      updateMotor();
-      lastDebounceTime = millis();
-    }
-    // Button DOWN pressed
-    else if (downState == LOW && lastDownState == HIGH) {
-      speedLevel = (speedLevel > 0) ? (speedLevel - 1) : 3;
-      updateMotor();
-      lastDebounceTime = millis();
+    if (gearState != steadyGearState) {
+      steadyGearState = gearState;
+      
+      // Only process when button goes LOW (pressed)
+      if (steadyGearState == LOW) {
+        selectedGear = (selectedGear % 3) + 1; // 1 -> 2 -> 3 -> 1
+        updateMotorState();
+      }
     }
   }
-  lastUpState   = upState;
-  lastDownState = downState;
+  lastGearState = gearState;
 
   // Sync to sent_sensorData
-  sent_sensorData.gear  = speedLevel;
+  sent_sensorData.gear  = selectedGear;
 
   // -----------------------------------------------------------------------------------------------------------------------
 
@@ -310,8 +372,34 @@ void loop() {
 
 
 
-  // --- 3. OTHER DATA ---
-  sent_sensorData.battery = 100; // Simulated battery
+  // --- 3. INA226 BATTERY MONITOR ---
+  float raw_vBus = readINA226BusVoltage();
+  
+  // ⚡ [ระบบกรองสัญญาณ (EMA Filter) สำหรับแบตเตอรี่]
+  // ช่วยแก้ปัญหา % แบตเด้งขึ้นลง 1-3% จากคลื่นรบกวนและอาการไฟตกชั่วขณะตอนมอเตอร์กระชาก
+  static float smoothedVBus = 0.0;
+  if (smoothedVBus == 0.0 && raw_vBus > 0) smoothedVBus = raw_vBus; // ตั้งค่าเริ่มต้นในรอบแรก
+  
+  if (raw_vBus > 0) {
+    smoothedVBus = (smoothedVBus * 0.95) + (raw_vBus * 0.05); // เชื่อค่าเก่า 95% รับค่าใหม่ 5%
+    batteryVoltage = smoothedVBus; // เอาค่าที่นิ่งแล้วไปใช้งานต่อ
+    
+    batteryCurrent = readINA226Current(); // อ่านค่ากระแส
+    batteryPower = batteryVoltage * batteryCurrent; // คำนวณกำลังไฟ (Watt) = โวลต์ x แอมป์
+
+    // แปลงแรงดัน (Voltage) เป็นเปอร์เซ็นต์ (0-100%)
+    // อัปเดตสเปค: แบตเตอรี่ LiFePO4 7S (ชาร์จเต็ม 25.55V, หมด 19.60V)
+    float vMax = 25.55; 
+    float vMin = 19.60;
+    int pct = (int)(((batteryVoltage - vMin) / (vMax - vMin)) * 100.0);
+    
+    if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+    
+    sent_sensorData.battery = pct;
+  } else {
+    sent_sensorData.battery = 0; 
+  }
 
 
 
@@ -394,7 +482,9 @@ void loop() {
 
     // ข้อมูลอื่นๆ
     Serial.println("\n--- Other Data ---");
-    Serial.printf("Battery:        %u%%\n", sent_sensorData.battery);
+    Serial.printf("Battery:        %u%% (%.2f V)\n", sent_sensorData.battery, batteryVoltage);
+    Serial.printf("Current:        %.2f A\n", batteryCurrent);
+    Serial.printf("Power:          %.2f W\n", batteryPower);
     Serial.printf("Gear:           %d\n", sent_sensorData.gear);
     Serial.printf("Speed:          %d m/s\n", sent_sensorData.speed);
     Serial.printf("Ext Voltage:    %.2f V\n", extActualVoltage);
@@ -417,16 +507,19 @@ void loop() {
 }
 
 /**
- * updateMotor: ตั้งค่าความเร็วเป้าหมายที่จะค่อยๆ ramp ไปหา
+ * updateMotorState: กำหนดความเร็วตามเกียร์และสถานะปุ่ม
  */
-void updateMotor() {
-  if (speedLevel == 1)      targetPWM = 1330; // ~33%
-  else if (speedLevel == 2) targetPWM = 1660; // ~66%
-  else if (speedLevel == 3) targetPWM = 2000; // 100%
-  else                      targetPWM = 1000; // 0% (หยุดหล่อลื่น)
+void updateMotorState() {
+  if (!isRunning) {
+    targetPWM = 1000; // 0% (หยุด)
+  } else {
+    if (selectedGear == 1)      targetPWM = 1330; // ~33%
+    else if (selectedGear == 2) targetPWM = 1660; // ~66%
+    else if (selectedGear == 3) targetPWM = 2000; // 100%
+  }
 
-  Serial.print("--- Command: Gear "); Serial.print(speedLevel);
-  Serial.print(" | Target Speed: "); Serial.print(speedLevel * 2);
+  Serial.print("--- Command: Gear "); Serial.print(selectedGear);
+  Serial.print(" | Running: "); Serial.print(isRunning ? "YES" : "NO");
   Serial.print(" | Target PWM: "); Serial.print(targetPWM); Serial.println(" us");
 }
 
