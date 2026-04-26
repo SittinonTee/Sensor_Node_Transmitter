@@ -35,7 +35,8 @@ const int ESC_PIN = 27;  // ย้ายมาใช้ขา 27 แทน (เ�
 Servo esc;               // ตัวแปรสำหรับควบคุม ESC
 
 // --- [Physical Button Pins for ESP32] ---
-const int BTN_RUN   = 4;  // กดค้างเพื่อทำงาน
+const int BTN_RUN   = 4;  // กดค้างเพื่อทำงาน (ปุ่ม 1)
+const int BTN_RUN2  = 5;  // กดค้างเพื่อทำงาน (ปุ่ม 2) - เปลี่ยนเป็นขาที่ต้องการใช้งานจริง
 const int BTN_GEAR  = 15; // กดเพื่อเปลี่ยนเกียร์ (1-3)
 
 // --- [External Pressure Sensor (GPIO 34)] ---
@@ -200,6 +201,19 @@ void setup() {
   // --- 1. SENSOR INITIALIZATION ---
   Wire.begin(); // เริ่มต้นบัส I2C
   
+  // ⚡ ระบบสแกนหาที่อยู่เซ็นเซอร์อัตโนมัติ (I2C Scanner)
+  Serial.println("\n--- [I2C Scanner] ---");
+  int deviceCount = 0;
+  for(byte address = 1; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("Found Device at Address: 0x%02X\n", address);
+      deviceCount++;
+    }
+  }
+  if (deviceCount == 0) Serial.println("No I2C devices found!");
+  Serial.println("---------------------\n");
+  
   // ตรวจสอบการเชื่อมต่อเซนเซอร์
   sent_sensorData.bno_online = bno.begin();      
   sent_sensorData.bmp_online = bmp.begin(0x76);  // เซนเซอร์ส่วนใหญ่ในโมดูลสำเร็จรูปใช้ 0x76
@@ -255,6 +269,7 @@ void setup() {
   // --- 3. MOTOR & BUTTON SETUP ---
   // Buttons with internal pull-ups (connect button to GND)
   pinMode(BTN_RUN, INPUT_PULLUP);
+  pinMode(BTN_RUN2, INPUT_PULLUP);
   pinMode(BTN_GEAR, INPUT_PULLUP);
 
   // ESC Initialization
@@ -307,11 +322,12 @@ void loop() {
   }
 
   // 2. Physical Button Control
-  bool runState   = digitalRead(BTN_RUN);
+  bool runState1  = digitalRead(BTN_RUN);
+  bool runState2  = digitalRead(BTN_RUN2);
   bool gearState  = digitalRead(BTN_GEAR);
 
-  // Check run button (Hold to run)
-  bool currentStateRunning = (runState == LOW);
+  // Check run button (Hold to run) - กดปุ่มไหนก็ได้ (LOW คือถูกกด)
+  bool currentStateRunning = (runState1 == LOW) || (runState2 == LOW);
   if (currentStateRunning != isRunning) {
     isRunning = currentStateRunning;
     updateMotorState();
