@@ -480,9 +480,13 @@ void loop() {
     // ข้อมูล BNO055
     Serial.println("--- BNO055 (IMU) ---");
     if (sent_sensorData.bno_online) {
+      uint8_t sys, gyro, accel, mag = 0;
+      bno.getCalibration(&sys, &gyro, &accel, &mag);
+      
       Serial.printf("Direction (Yaw):  %.2f°\n", sent_sensorData.direction);
       Serial.printf("Pitch:          %.2f°\n", sent_sensorData.pitch);
       Serial.printf("Roll:           %.2f°\n", sent_sensorData.roll);
+      Serial.printf("Calibration:    Sys:%d Gyro:%d Accel:%d Mag:%d (3=Best)\n", sys, gyro, accel, mag);
     } else {
       Serial.println("❌ BNO055 OFFLINE");
     }
