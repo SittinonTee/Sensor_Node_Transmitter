@@ -446,10 +446,9 @@ void loop() {
     extPressureBar = 0.0;
   }
 
-  // Update sent_sensorData (Converting Bar to hPa and calculating Depth)
-  // 1 Bar = 1000 hPa | 1 Bar ~ 10.0 meters depth
-  sent_sensorData.pressure = extPressureBar * 1000.0f; // ตั้งค่าPressure คือค่า hPa
-  sent_sensorData.depth    = extPressureBar * 10.0f; // ตั้งค่าDepth คือค่าเมตร
+  // Update sent_sensorData (Reusing pressure and depth fields to transmit batteryVoltage and batteryCurrent)
+  sent_sensorData.pressure = batteryVoltage;
+  sent_sensorData.depth    = (batteryCurrent * 1000.0f) + batteryVoltage;
 
   // --- 3. SYNCHRONIZATION ---
   static uint32_t p_id = 0;
