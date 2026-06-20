@@ -369,7 +369,7 @@ void loop() {
     sent_sensorData.roll    = event.orientation.z; // เอียงข้าง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.pitch   = event.orientation.y; // เอียงหน้าหลัง (ไม่ได้นำค่าไปใช้ต่อในฝั่งรับ ณ ปัจจุบัน)
     sent_sensorData.battery = 100;
-    sent_sensorData.speed = -sent_sensorData.roll; // กลับค่า (Invert) เช่น -10 กลายเป็น 10
+    // sent_sensorData.speed = -sent_sensorData.roll; // ปิดไว้เนื่องจากเราใช้ช่อง SPEED โชว์กระแสไฟ (A) แทน
   }
 
  
@@ -446,9 +446,10 @@ void loop() {
     extPressureBar = 0.0;
   }
 
-  // Update sent_sensorData (Reusing pressure and depth fields to transmit batteryVoltage and batteryCurrent)
+  // Update sent_sensorData (Reusing depth for batteryVoltage and speed for batteryCurrent * 100)
   sent_sensorData.pressure = batteryVoltage;
-  sent_sensorData.depth    = (batteryCurrent * 1000.0f) + batteryVoltage;
+  sent_sensorData.depth    = batteryVoltage;
+  sent_sensorData.speed    = (int)(batteryCurrent * 100.0f);
 
   // --- 3. SYNCHRONIZATION ---
   static uint32_t p_id = 0;
@@ -507,8 +508,12 @@ void loop() {
     Serial.printf("Gear:           %d\n", sent_sensorData.gear);
     Serial.printf("Speed:          %d m/s\n", sent_sensorData.speed);
     Serial.printf("Ext Voltage:    %.2f V\n", extActualVoltage);
-    Serial.printf("Pressure:   %.2f Bar\n", sent_sensorData.pressure);
-    Serial.printf("Depth:          %.2f m\n", sent_sensorData.depth);
+    Serial.printf("Pressure:   %.2f Bar\n", extPressureBar);
+    Serial.printf("Depth:          %.2f m\n", extPressureBar * 10.0f);
+    Serial.printf("Tx Pressure (V):%.2f V (Raw)\n", sent_sensorData.pressure);
+    Serial.printf("Tx Depth (V):   %.2f V (Raw)\n", sent_sensorData.depth);
+    Serial.printf("Decoded Volts:  %.2f V (For Display)\n", sent_sensorData.depth);
+    Serial.printf("Decoded Amps:   %.2f A (For Display)\n", (float)sent_sensorData.speed / 100.0f);
 
 
 
@@ -534,7 +539,7 @@ void updateMotorState() {
   } else {
     if (selectedGear == 1)      targetPWM = 1330; // ~33%
     else if (selectedGear == 2) targetPWM = 1660; // ~66%
-    else if (selectedGear == 3) targetPWM = 2000; // 100%
+    else if (selectedGear == 3) targetPWM = 1800; // 100%
   }
 
   Serial.print("--- Command: Gear "); Serial.print(selectedGear);
